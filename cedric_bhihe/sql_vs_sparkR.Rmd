@@ -1,0 +1,302 @@
+---
+title: "Window Functions with Hive and SparkR"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+## Getting data
+
+Download all datasets from  <https://www.kaggle.com/c/competitive-data-science-predict-future-sales/data> into directory `future_sales_data` and uznip it.
+
+## Access to data from spark
+
+
+```{r}
+library(magrittr)
+spark_path <- '/Users/bartek/programs/spark-2.3.0-bin-hadoop2.7'
+if (nchar(Sys.getenv("SPARK_HOME")) < 1) {
+  Sys.setenv(SPARK_HOME = spark_path)
+}
+library(SparkR, lib.loc = c(file.path(Sys.getenv("SPARK_HOME"), "R", "lib")))
+sparkR.session(master = "local[*]", sparkConfig = list(spark.driver.memory = "2g"))
+```
+
+```{r}
+sales_sdf <- read.df("../future_sales_data/sales_train.csv.gz", "csv", header = "true", inferSchema = "true")
+sales_sdf %>%
+  head
+```
+
+## Example of query
+
+<https://spark.apache.org/docs/latest/api/R/index.html>
+
+### Register table
+
+```{r}
+createOrReplaceTempView(sales_sdf, "sales")
+```
+
+```{r}
+sales10_sdf <- "
+SELECT *
+FROM sales
+LIMIT 10
+" %>%
+  sql
+
+sales10_sdf
+```
+
+```{r}
+sales10_df <-
+  sales10_sdf %>%
+  collect
+sales10_df
+```
+
+## SELECT ~ select
+
+```{r}
+"SELECT shop_id
+FROM sales" %>%
+  sql %>%
+  head
+```
+
+```{r}
+sales_sdf %>%
+  select("shop_id") %>%
+  head
+```
+
+## WHERE ~ filter
+
+```{r}
+"SELECT *
+FROM sales
+WHERE shop_id = 25" %>%
+  sql %>%
+  head
+```
+
+```{r}
+sales_sdf %>%
+  filter(sales_sdf$shop_id == 25) %>%
+  head
+```
+
+## ORDER ~ sort
+
+```{r}
+"SELECT *
+FROM sales
+WHERE shop_id = 25
+AND item_id = 2252
+ORDER BY date
+" %>%
+  sql %>%
+  head(10)
+```
+
+```{r}
+sales_sdf %>%
+  filter(sales_sdf$shop_id == 25 & sales_sdf$item_id == 2252) %>%
+  orderBy("date") %>%
+  head(10)
+```
+
+```{r}
+sales_sdf %>%
+  filter(sales_sdf$shop_id == 25 & sales_sdf$item_id == 2252) %>%
+  orderBy(desc(sales_sdf$item_cnt_day)) %>%
+  head(10)
+```
+
+## AS ~ alias
+
+```{r}
+sales_sdf %>%
+  select(
+    alias(sales_sdf$item_cnt_day * sales_sdf$item_price, "income")
+  ) %>%
+  head
+```
+
+## aggregators ~ summarise
+
+
+```{r}
+"SELECT AVG(item_cnt_day) AS mean_sale
+,   STDDEV(item_cnt_day) AS sd_sales
+,   SUM(item_cnt_day) AS sum_sales
+,   COUNT(1) AS nitems
+FROM sales" %>%
+  sql %>%
+  collect
+```
+
+```{r}
+sales_sdf %>%
+  select(
+    alias(mean(sales_sdf$item_cnt_day), "mean_sales"),
+    alias(stddev(sales_sdf$item_cnt_day), "sd_sales"),
+    alias(sum(sales_sdf$item_cnt_day), "sum_sales"),
+    alias(n(sales_sdf$item_cnt_day), "n_items")
+  ) %>%
+  collect
+```
+
+## GROUP BY
+
+```{r}
+library('ggplot2')
+"SELECT unix_timestamp(date, 'dd.MM.yyyy') AS date
+,   SUM(item_cnt_day) AS items_sold
+FROM sales
+GROUP BY date
+" %>%
+  sql %>%
+  collect %>%
+  ggplot(., aes(date, items_sold)) +
+  geom_line(colour="darkorange") +
+  theme_minimal()
+```
+
+```{r}
+sales_sdf %>%
+  withColumn("dt", unix_timestamp(.$date, 'dd.MM.yyyy')) %>%
+  groupBy(.$dt) %>%
+  summarize(items_sold=sum(sales_sdf$item_cnt_day)) %>%
+  collect %>%
+  ggplot(., aes(dt, items_sold)) +
+  geom_line(colour="darkorange") +
+  theme_minimal()
+```
+
+
+## Window Function (Hive)
+
+<https://cwiki.apache.org/confluence/display/Hive/LanguageManual+WindowingAndAnalytics>
+
+Let's add a column that have total number of sales for each shop and item.
+
+```{r}
+"SELECT *
+,   SUM(item_cnt_day) OVER (PARTITION BY date, shop_id) AS total_items
+FROM sales
+" %>%
+  sql %>%
+  head(100)
+```
+
+And some more things:
+```{r}
+"SELECT *
+,   SUM(total_items) OVER (
+        PARTITION BY shop_id ORDER BY date_block_num ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        AS cumulative_itmes
+FROM (
+    SELECT date_block_num
+    ,   shop_id
+    ,   SUM(item_cnt_day) AS total_items
+    FROM sales
+    GROUP BY date_block_num
+    ,   shop_id
+) totals
+" %>%
+  sql %>%
+  head
+```
+
+```{r}
+"SELECT *
+,   AVG(total_items) OVER (
+        PARTITION BY shop_id ORDER BY date_block_num ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING)
+        AS moving_average
+FROM (
+    SELECT date_block_num
+    ,   shop_id
+    ,   SUM(item_cnt_day) AS total_items
+    FROM sales
+    GROUP BY date_block_num
+    ,   shop_id
+) totals
+" %>%
+  sql %>%
+  head
+```
+
+### Question
+
+Could you explain the difference between those two queries?
+
+#### Query 1
+```{r}
+"SELECT *
+,   LAG(total_items) OVER (
+        PARTITION BY shop_id ORDER BY date_block_num)
+        AS previous_value
+FROM (
+    SELECT date_block_num
+    ,   shop_id
+    ,   SUM(item_cnt_day) AS total_items
+    FROM sales
+    GROUP BY date_block_num
+    ,   shop_id
+) totals
+ORDER BY shop_id
+,   date_block_num
+" %>%
+  sql %>%
+  head(20)
+```
+
+#### Query 2
+```{r}
+"SELECT this_day.date_block_num
+,   this_day.shop_id
+,   this_day.total_items
+,   prev_day.total_items AS previous_value
+FROM (
+    SELECT date_block_num
+    ,   shop_id
+    ,   SUM(item_cnt_day) AS total_items
+    FROM sales
+    GROUP BY date_block_num
+    ,   shop_id
+) this_day
+LEFT JOIN (
+    SELECT date_block_num
+    ,   shop_id
+    ,   SUM(item_cnt_day) AS total_items
+    FROM sales
+    GROUP BY date_block_num
+    ,   shop_id
+) prev_day
+ON this_day.date_block_num = prev_day.date_block_num+1
+AND this_day.shop_id = prev_day.shop_id
+ORDER BY shop_id
+,   date_block_num
+" %>%
+  sql %>%
+  head(20)
+```
+
+
+
+## Lateral view
+
+```{r}
+"SELECT *
+FROM sales LATERAL VIEW explode(split(date, '\\\\.')) t AS numbers
+LIMIT 10
+" %>%
+  sql %>%
+  head
+```
+
+
+
+
